@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Async Import Pipeline</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9; --panel: #fff; --text: #17202c; --muted: #5b6776; --line: #dde2e8;
+  --accent: #1f5fbf; --ok: #16794c; --ok-bg: #e3f4ec; --bad: #b3261e; --bad-bg: #fbe9e7;
+  --wait: #7a5a00; --wait-bg: #fbf1d3;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11161d; --panel: #1a212b; --text: #e8edf3; --muted: #9aa7b5; --line: #2e3945;
+    --accent: #7fb0ff; --ok: #6fd6a4; --ok-bg: #173327; --bad: #ff9d94; --bad-bg: #3b1f1d;
+    --wait: #f1cf73; --wait-bg: #3a3017;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 720px; margin: 0 auto; padding: 40px 16px; }
+h1 { font-size: 1.6rem; margin: 0 0 4px; }
+h2 { font-size: 1rem; margin: 32px 0 12px; }
+p { margin: 0; color: var(--muted); }
+a { color: var(--accent); }
+.drop { display: block; margin-top: 24px; padding: 32px 16px; text-align: center; cursor: pointer;
+  background: var(--panel); border: 2px dashed var(--line); border-radius: 12px; }
+.drop.over, .drop:focus-within { border-color: var(--accent); }
+.drop strong { color: var(--accent); }
+.drop input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.samples { margin-top: 12px; font-size: .9rem; }
+ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+li { display: grid; grid-template-columns: 1fr auto auto; gap: 4px 12px; align-items: center;
+  padding: 12px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.name { font-weight: 600; overflow-wrap: anywhere; }
+.detail { grid-column: 1 / -1; font-size: .9rem; color: var(--muted); overflow-wrap: anywhere; }
+.badge { font-size: .8rem; font-weight: 600; padding: 2px 10px; border-radius: 99px;
+  color: var(--wait); background: var(--wait-bg); }
+.badge.success { color: var(--ok); background: var(--ok-bg); }
+.badge.error { color: var(--bad); background: var(--bad-bg); }
+button { font: inherit; color: var(--muted); background: none; border: 0; cursor: pointer;
+  min-width: 32px; min-height: 32px; border-radius: 6px; }
+button:hover { color: var(--text); background: var(--line); }
+#empty { font-size: .95rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Import a price sheet</h1>
+  <p>The file goes straight to storage. Keep working: the result appears here, even after a reload.</p>
+  <label class="drop" id="drop">
+    <input id="file" type="file" accept="application/pdf">
+    <strong>Choose a PDF</strong> or drop it here
+  </label>
+  <p class="samples">Try <a href="/samples/valid.pdf" download>a valid sheet</a> or
+    <a href="/samples/invalid.pdf" download>one with bad rows</a>.</p>
+  <h2>Imports</h2>
+  <p id="empty">Nothing imported yet.</p>
+  <ul id="list" aria-live="polite"></ul>
+</main>
+<script>
+const KEY = 'imports';
+const MAX_SIZE = 5120000;
+const LABELS = { uploading: 'Uploading', pending: 'Validating', processing: 'Processing',
+                 success: 'Imported', error: 'Failed' };
+const isOpen = (job) => job.status !== 'success' && job.status !== 'error';
+
+function load() {
+  try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch { return []; }
+}
+let jobs = load();
+let socket = null;
+let retryDelay = 1000;
+
+function save() {
+  try { localStorage.setItem(KEY, JSON.stringify(jobs)); } catch { /* private mode */ }
+}
+
+function detail(job) {
+  if (job.status === 'success') {
+    const count = job.record_ids.length;
+    return `${count} ${count === 1 ? 'record' : 'records'} created or updated`;
+  }
+  return job.status === 'error' ? job.message : '';
+}
+
+function render() {
+  document.getElementById('empty').hidden = jobs.length > 0;
+  document.getElementById('list').replaceChildren(...jobs.map((job) => {
+    const item = document.createElement('li');
+    const name = Object.assign(document.createElement('span'),
+      { className: 'name', textContent: job.file_name });
+    const badge = Object.assign(document.createElement('span'),
+      { className: `badge ${job.status}`, textContent: LABELS[job.status] });
+    const dismiss = Object.assign(document.createElement('button'),
+      { type: 'button', textContent: '✕', ariaLabel: `Dismiss ${job.file_name}` });
+    dismiss.onclick = () => { jobs = jobs.filter((other) => other !== job); save(); render(); };
+    item.append(name, badge, dismiss);
+    const text = detail(job);
+    if (text) item.append(Object.assign(document.createElement('span'),
+      { className: 'detail', textContent: text }));
+    return item;
+  }));
+}
+
+function update(task_id, fields) {
+  const job = jobs.find((other) => other.task_id === task_id);
+  if (!job) return;
+  Object.assign(job, fields);
+  save();
+  render();
+}
+
+function subscribe(job) {
+  if (job.token && socket?.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ action: 'subscribe', task_id: job.task_id, token: job.token }));
+  }
+}
+
+function connect() {
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  socket = new WebSocket(`${scheme}://${location.host}/ws`);
+  socket.onopen = () => {
+    retryDelay = 1000;
+    jobs.filter(isOpen).forEach(subscribe); // every reconnect restores every subscription
+  };
+  socket.onmessage = (event) => {
+    const { task_id, status, message, record_ids } = JSON.parse(event.data);
+    // The browser's own "uploading" state wins until the PUT has finished.
+    const job = jobs.find((other) => other.task_id === task_id);
+    if (job?.status === 'uploading' && status === 'pending') return;
+    update(task_id, { status, message, record_ids });
+  };
+  socket.onclose = () => {
+    setTimeout(connect, retryDelay);
+    retryDelay = Math.min(retryDelay * 2, 30000);
+  };
+}
+
+async function importFile(file) {
+  const job = { task_id: crypto.randomUUID(), file_name: file.name, status: 'uploading',
+                record_ids: [], message: '' };
+  jobs.unshift(job);
+  render();
+  try {
+    if (file.size > MAX_SIZE) throw new Error('The file is larger than the 5120 KB limit.');
+    const created = await fetch('/imports', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: file.name }),
+    });
+    if (!created.ok) throw new Error('The import could not be started.');
+    const { url, task_id, token } = await created.json();
+    Object.assign(job, { task_id, token });
+    save();
+    subscribe(job); // before the upload, so no result can be missed
+    const uploaded = await fetch(url, { method: 'PUT', body: file });
+    if (!uploaded.ok) throw new Error(`Upload failed with status ${uploaded.status}.`);
+    if (job.status === 'uploading') update(task_id, { status: 'pending' });
+  } catch (error) {
+    update(job.task_id, { status: 'error', message: error.message });
+  }
+}
+
+const drop = document.getElementById('drop');
+const input = document.getElementById('file');
+input.onchange = () => {
+  [...input.files].forEach(importFile);
+  input.value = '';
+};
+['dragenter', 'dragover'].forEach((name) => drop.addEventListener(name, (event) => {
+  event.preventDefault();
+  drop.classList.add('over');
+}));
+['dragleave', 'drop'].forEach((name) => drop.addEventListener(name, (event) => {
+  event.preventDefault();
+  drop.classList.remove('over');
+}));
+drop.addEventListener('drop', (event) => [...event.dataTransfer.files].forEach(importFile));
+
+render();
+connect();
+</script>
+</body>
+</html>

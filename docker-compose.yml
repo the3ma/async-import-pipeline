@@ -1,0 +1,67 @@
+# Local demo only: these credentials are placeholders.
+x-app: &app
+  build: .
+  environment:
+    DATABASE_URL: postgresql://postgres:postgres@db:5432/imports
+    AWS_ENDPOINT: http://localstack:4566
+    AWS_PUBLIC_ENDPOINT: http://localhost:4577
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    AWS_DEFAULT_REGION: us-east-1
+    IMPORT_SECRET: local-dev-secret
+    API_WEBHOOK_URL: http://api:8000/webhook/import
+    SWEEP_SECONDS: "2"
+    STALE_SECONDS: "5"
+  depends_on:
+    db: { condition: service_healthy }
+    localstack: { condition: service_healthy }
+
+x-api: &api
+  <<: *app
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/healthz')"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: imports
+      POSTGRES_PASSWORD: postgres
+    ports: ["5544:5432"]
+    volumes:
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d imports"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:4
+    environment:
+      SERVICES: s3,sqs
+      S3_SKIP_SIGNATURE_VALIDATION: "0" # signed URLs are really checked, expiry included
+    ports: ["4577:4566"]
+    volumes:
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name upload-events"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  edge:
+    <<: *app
+    command: ["python", "-m", "importer.edge"]
+
+  api:
+    <<: *api
+    ports: ["8100:8000"]
+
+  # A second replica proves results reach subscribers on any instance.
+  api-replica:
+    <<: *api
+    ports: ["8101:8000"]
