@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Async import pipeline · Case study</title>
+  <meta name="description" content="Case study: importing user files without carrying a single byte through the API request path - signed uploads, edge validation, a worker pool with a database sweeper, and results pushed over WebSockets.">
+  <meta property="og:title" content="Async import pipeline · Case study">
+  <meta property="og:description" content="The file never touches the API: signed uploads, edge validation, a worker pool and WebSocket results, with every job ending in a final state.">
+  <meta property="og:type" content="article">
+  <meta name="color-scheme" content="dark light">
+  <link rel="preload" href="assets/fonts/overpass-latin-var.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="assets/styles.css">
+  <script>
+    // Saved theme before first paint; otherwise follow the system (dark-first stylesheet).
+    (function () {
+      var root = document.documentElement, saved = null;
+      try { saved = localStorage.getItem('theme'); } catch (e) {}
+      if (saved === 'light' || saved === 'dark') root.setAttribute('data-theme', saved);
+      var dark = saved ? saved === 'dark' : !window.matchMedia('(prefers-color-scheme: light)').matches;
+      root.setAttribute('data-resolved', dark ? 'dark' : 'light');
+    })();
+  </script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="wrap">
+    <a class="product" href="#top"><span class="mark" aria-hidden="true"></span><strong><span class="long">Async import pipeline</span><span class="short">Import pipeline</span></strong><span class="sub">Case study</span></a>
+    <div class="topbar-actions">
+      <button class="btn btn-secondary btn-sm theme-toggle" type="button" id="theme-toggle" aria-pressed="false">
+        <svg class="icon-moon" viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 9.6A5.6 5.6 0 0 1 6.4 2.5a5.6 5.6 0 1 0 7.1 7.1Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+        <svg class="icon-sun" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1v1.6M8 13.4V15M1 8h1.6M13.4 8H15M3 3l1.1 1.1M11.9 11.9 13 13M3 13l1.1-1.1M11.9 4.1 13 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span class="label">Light theme</span>
+      </button>
+      <a class="btn btn-primary btn-sm topbar-contact" href="#contact" aria-label="Contact"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="3.25" width="12.5" height="9.5" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m2.5 4.5 5.5 4 5.5-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg><span class="label">Contact</span></a>
+    </div>
+  </div>
+  <div class="progress" aria-hidden="true"></div>
+</header>
+
+<main id="main">
+
+<section class="hero" id="top" aria-labelledby="title">
+  <div class="wrap">
+    <h1 id="title">The file never touches the API.</h1>
+    <p class="lead">How an import that parsed uploaded files inside an HTTP request became a pipeline that carries not a single byte through the API: the browser uploads straight to storage with a short-lived signed URL, an edge validator stops bad files before the application, a worker pool turns the file into records in one transaction, and the result is pushed back over a WebSocket while the user keeps working. The pattern has run in production for two years; this public reference implementation rebuilds it, fixes the original&rsquo;s known weaknesses and records its seven key decisions as ADRs.</p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="#contact">Contact</a>
+      <a class="btn btn-secondary" href="#architecture">Read the architecture</a>
+    </div>
+
+    <figure class="hero-map" aria-labelledby="hm-t">
+      <div class="map-h"><div class="diagram" tabindex="0" role="region" aria-label="The line one import rides">
+        <svg class="dg" viewBox="0 0 920 290" role="img" aria-labelledby="hm-t hm-d">
+          <title id="hm-t">The line one import rides</title>
+          <desc id="hm-d">The import line runs through six stations: the API signs a job and a one-object upload URL, the browser uploads the file straight to storage, the edge checks the size and five bytes, a worker processes the file, the records are committed in one transaction, and the result is pushed over a WebSocket from any replica. From the edge, the fail line leads to a rejected file: deleted, and the API told why. From processing, the recovery line leads to the sweeper, which resubmits, resumes or expires the job, so every job ends in a final state.</desc>
+          <path class="rail fail" d="M380,90 L380,180 Q380,214 346,214 L260,214"/>
+          <path class="rail recover" d="M540,90 L540,180 Q540,214 574,214 L700,214"/>
+          <path class="rail import" d="M60,90 L860,90"/>
+
+          <circle class="stn import" cx="60" cy="90" r="11"/>
+          <circle class="stn import" cx="220" cy="90" r="11"/>
+          <circle class="stn ix" cx="380" cy="90" r="14"/>
+          <circle class="stn ix" cx="540" cy="90" r="14"/>
+          <circle class="stn import" cx="700" cy="90" r="11"/>
+          <circle class="stn term" cx="860" cy="90" r="13"/>
+          <circle class="stn term" cx="260" cy="214" r="13" style="fill:var(--l-fail);stroke:var(--l-fail)"/>
+          <circle class="stn term" cx="700" cy="214" r="13" style="fill:var(--l-recover);stroke:var(--l-recover)"/>
+
+          <text class="title" x="60" y="52" text-anchor="middle">Signed</text>
+          <text class="small" x="60" y="128" text-anchor="middle">job + 15-min URL</text>
+          <text class="title" x="220" y="52" text-anchor="middle">Uploaded</text>
+          <text class="small" x="220" y="128" text-anchor="middle">straight to storage</text>
+          <text class="title" x="380" y="52" text-anchor="middle">Edge</text>
+          <text class="small lbl-bg" x="380" y="134" text-anchor="middle">size + 5 bytes</text>
+          <text class="title" x="540" y="52" text-anchor="middle">Processed</text>
+          <text class="small lbl-bg" x="540" y="134" text-anchor="middle">worker, own process</text>
+          <text class="title" x="700" y="52" text-anchor="middle">Committed</text>
+          <text class="small" x="700" y="128" text-anchor="middle">one transaction</text>
+          <text class="title" x="860" y="52" text-anchor="middle">Pushed</text>
+          <text class="small" x="860" y="128" text-anchor="middle">WebSocket push</text>
+
+          <text class="title" x="260" y="254" text-anchor="middle">Rejected</text>
+          <text class="small" x="260" y="272" text-anchor="middle">deleted, the API told why</text>
+          <text class="title" x="700" y="254" text-anchor="middle">Sweeper</text>
+          <text class="small" x="700" y="272" text-anchor="middle">resubmit, resume or expire</text>
+        </svg>
+      </div>
+      <p class="scroll-note">Swipe the map sideways to follow the whole line.</p></div>
+      <div class="map-v">
+        <svg class="dg" viewBox="0 0 340 580" role="img" aria-labelledby="hmv-t hmv-d"><title id="hmv-t">The line one import rides, from the signed URL to the pushed result, with the rejection and recovery branches</title><desc id="hmv-d">The import line from a signed job through the direct upload, the edge check, processing and the one-transaction commit to the pushed result. Below it, a file the edge rejects is deleted, and a stuck job is resubmitted, resumed or expired by the sweeper.</desc>
+          <path class="rail import" d="M40,30 L40,390"/>
+          <circle class="stn import" cx="40" cy="30" r="11"/><text class="title" x="72" y="28">Signed</text><text class="small" x="72" y="46">job + 15-minute upload URL</text>
+          <circle class="stn import" cx="40" cy="102" r="11"/><text class="title" x="72" y="100">Uploaded</text><text class="small" x="72" y="118">straight to storage</text>
+          <circle class="stn ix" cx="40" cy="174" r="14"/><text class="title" x="72" y="172">Edge</text><text class="small" x="72" y="190">size + 5 bytes, before the app</text>
+          <circle class="stn ix" cx="40" cy="246" r="14"/><text class="title" x="72" y="244">Processed</text><text class="small" x="72" y="262">worker in its own process</text>
+          <circle class="stn import" cx="40" cy="318" r="11"/><text class="title" x="72" y="316">Committed</text><text class="small" x="72" y="334">one transaction per file</text>
+          <circle class="stn term" cx="40" cy="390" r="13"/><text class="title" x="72" y="388">Pushed</text><text class="small" x="72" y="406">WebSocket, from any replica</text>
+          <circle class="stn fail" cx="40" cy="462" r="11"/><text class="title" x="72" y="460">Rejected</text><text class="small" x="72" y="478">branch from the edge: deleted, API told</text>
+          <circle class="stn term" cx="40" cy="534" r="13" style="fill:var(--l-recover);stroke:var(--l-recover)"/><text class="title" x="72" y="532">Sweeper</text><text class="small" x="72" y="550">branch from processing: never stranded</text>
+        </svg>
+      </div>
+    </figure>
+
+    <dl class="meta">
+      <div><dt>My role</dt><dd>Architect &amp; full-stack engineer</dd></div>
+      <div><dt>Scope</dt><dd>Browser upload, storage events, edge validation, workers, push notifications</dd></div>
+      <div><dt>Stack</dt><dd>FastAPI, PostgreSQL, S3 / Azure Blob, Azure Functions, Vue, Docker Compose</dd></div>
+      <div><dt>Status</dt><dd>Generalized from production work, with a runnable reference &middot; <a href="https://github.com/the3ma/async-import-pipeline">source on GitHub</a></dd></div>
+    </dl>
+  </div>
+</section>
+
+<div class="wrap layout">
+  <nav class="toc" aria-label="On this page">
+    <h2>On this page</h2>
+    <ol>
+      <li><a href="#summary">Summary</a></li>
+      <li><a href="#failures">The failures</a></li>
+      <li><a href="#requirements">Requirements</a></li>
+      <li><a href="#users">Who it serves</a></li>
+      <li><a href="#product">The product</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#decisions">Decisions</a></li>
+      <li><a href="#implementation">Implementation</a></li>
+      <li><a href="#operations">Operations</a></li>
+      <li><a href="#tradeoffs">Trade-offs</a></li>
+      <li><a href="#results">Results</a></li>
+      <li><a href="#try">Try it</a></li>
+      <li><a href="#lessons">Lessons</a></li>
+      <li><a href="#next">What&rsquo;s next</a></li>
+      <li><a href="#contact">Contact</a></li>
+    </ol>
+  </nav>
+
+  <article class="article">
+    <details class="toc-mobile">
+      <summary><span>On this page</span><span class="toc-current"></span></summary>
+      <ol>
+        <li><a href="#summary">Summary</a></li>
+        <li><a href="#failures">The failures</a></li>
+        <li><a href="#requirements">Requirements</a></li>
+        <li><a href="#users">Who it serves</a></li>
+        <li><a href="#product">The product</a></li>
+        <li><a href="#architecture">Architecture</a></li>
+        <li><a href="#decisions">Decisions</a></li>
+        <li><a href="#implementation">Implementation</a></li>
+        <li><a href="#operations">Operations</a></li>
+        <li><a href="#tradeoffs">Trade-offs</a></li>
+        <li><a href="#results">Results</a></li>
+        <li><a href="#try">Try it</a></li>
+        <li><a href="#lessons">Lessons</a></li>
+        <li><a href="#next">What&rsquo;s next</a></li>
+        <li><a href="#contact">Contact</a></li>
+      </ol>
+    </details>
+
+    <!-- SUMMARY -->
+    <section class="section" id="summary" aria-labelledby="h-summary">
+      <h2 id="h-summary">Executive summary</h2>
+      <p class="intro">The whole story in thirty seconds.</p>
+      <div class="ruled-3">
+        <div><h3>The problem</h3><p>Parsing an uploaded file inside an HTTP request ties up the API for the whole upload and parse, and the user watches a spinner that dies with the connection.</p></div>
+        <div><h3>The approach</h3><p>Split the job into four stages that share only a UUID: sign, upload, validate, process. Job state lives in one database row, so any stage can fail and be recovered.</p></div>
+        <div><h3>The outcome</h3><p>The API only signs URLs and updates state. Bad files stop before the application. Results survive reloads, restarts and killed workers.</p></div>
+      </div>
+    </section>
+
+    <!-- FAILURES -->
+    <section class="section" id="failures" aria-labelledby="h-failures">
+      <h2 id="h-failures">What a synchronous import gets wrong</h2>
+      <p class="intro">Seven failure modes of parsing a file inside the request, and the mechanism that removes each one.</p>
+      <div class="table-wrap">
+        <table class="stack-sm">
+          <thead><tr><th scope="col">Symptom</th><th scope="col">Root cause</th><th scope="col">Fixed by</th></tr></thead>
+          <tbody>
+            <tr><th scope="row" data-label="Symptom">The upload times out at the gateway</th><td data-label="Root cause">The file passes through the API and the ingress</td><td data-label="Fixed by"><span class="fix">a direct-to-storage signed URL</span></td></tr>
+            <tr><th scope="row" data-label="Symptom">The API slows for everyone during an import</th><td data-label="Root cause">CPU-bound parsing on the event loop</td><td data-label="Fixed by"><span class="fix">separate worker processes</span></td></tr>
+            <tr><th scope="row" data-label="Symptom">Junk files reach the parser</th><td data-label="Root cause">No check before processing</td><td data-label="Fixed by"><span class="fix">edge validation</span></td></tr>
+            <tr><th scope="row" data-label="Symptom">A half-imported file leaves partial records</th><td data-label="Root cause">Row-by-row commits</td><td data-label="Fixed by"><span class="fix">one transaction per file</span></td></tr>
+            <tr><th scope="row" data-label="Symptom">The user reloads and loses the result</th><td data-label="Root cause">The result is tied to the open request</td><td data-label="Fixed by"><span class="fix">a durable job row, replayed on subscribe</span></td></tr>
+            <tr><th scope="row" data-label="Symptom">Two uploads collide on a filename</th><td data-label="Root cause">A user-chosen storage key</td><td data-label="Fixed by"><span class="fix">a server-generated UUID key</span></td></tr>
+            <tr><th scope="row" data-label="Symptom">A leaked upload link stays usable</th><td data-label="Root cause">Long-lived or broad credentials</td><td data-label="Fixed by"><span class="fix">write-only, one object, 15 minutes</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="source-note">These are the failure modes of a synchronous import, not incidents from the original system. Generalized from production work: the client and product are not named, and the demo domain, price sheets, is invented.</p>
+    </section>
+
+    <!-- REQUIREMENTS -->
+    <section class="section" id="requirements" aria-labelledby="h-requirements">
+      <h2 id="h-requirements">What the pipeline had to guarantee</h2>
+      <p class="intro">Nine goals, each with the mechanism that meets it; the repository pairs every one with the acceptance test or benchmark that proves it.</p>
+      <ul class="stations">
+        <li><strong>Keep file bytes out of the API</strong><span>A signed PUT: the browser uploads to storage. Proved by <code>make bench</code>.</span></li>
+        <li><strong>Never block the user</strong><span>The upload returns at once and the result arrives by push, even from another replica.</span></li>
+        <li><strong>Reject bad input cheaply</strong><span>The edge reads the size and 5 bytes; an executable renamed to <code>.pdf</code> never reaches the parser.</span></li>
+        <li><strong>Keep the API responsive while parsing</strong><span>Parsing runs in separate worker processes, off the event loop.</span></li>
+        <li><strong>All-or-nothing imports</strong><span>Every row is validated, then one transaction writes them; one bad row writes nothing.</span></li>
+        <li><strong>Never strand a job</strong><span>A database sweeper resumes a job abandoned by a dead worker, recovers a lost webhook and expires abandoned uploads.</span></li>
+        <li><strong>Survive crashes</strong><span>A broken worker pool is replaced, and imports keep working after a worker process is killed.</span></li>
+        <li><strong>Lose no result</strong><span>A late subscriber reads the result from the job row.</span></li>
+        <li><strong>Refuse forged input</strong><span>An HMAC-signed webhook, and a per-task token to read a status.</span></li>
+      </ul>
+      <p class="source-note">Out of scope on purpose: resumable uploads, files above a few MB, per-row partial success and progress percentages.</p>
+    </section>
+
+    <!-- USERS -->
+    <section class="section" id="users" aria-labelledby="h-users">
+      <h2 id="h-users">Who it serves</h2>
+      <p class="intro">Three people touch an import: the one who uploads the file, the one who keeps imports healthy, and the one who changes the pipeline.</p>
+      <div class="ruled-3 personas">
+        <article class="persona">
+          <h3>Catalogue editor</h3>
+          <p class="role">Loads price sheets</p>
+          <dl>
+            <div><dt>Job</dt><dd>Load a price sheet and get on with the day.</dd></div>
+            <div><dt>What they get</dt><dd>Pick a file, carry on, and see every problem in a bad file at once.</dd></div>
+          </dl>
+        </article>
+        <article class="persona">
+          <h3>Operator</h3>
+          <p class="role">Keeps imports healthy</p>
+          <dl>
+            <div><dt>Job</dt><dd>Know what every import did, and fix the ones that stopped.</dd></div>
+            <div><dt>What they get</dt><dd>Machine-readable error codes, one row per job, and jobs that heal themselves.</dd></div>
+          </dl>
+        </article>
+        <article class="persona">
+          <h3>Developer</h3>
+          <p class="role">Changes the pipeline</p>
+          <dl>
+            <div><dt>Job</dt><dd>Change and test the pipeline safely.</dd></div>
+            <div><dt>What they get</dt><dd>The whole flow on one machine with one command, and no cloud account.</dd></div>
+          </dl>
+        </article>
+      </div>
+    </section>
+
+    <!-- PRODUCT -->
+    <section class="section" id="product" aria-labelledby="h-product">
+      <h2 id="h-product">The product</h2>
+      <p class="intro">Pick a file and keep working; the result arrives on its own, and a bad file explains itself.</p>
+      <figure class="shot">
+        <img src="images/import-tray.png" width="1760" height="1280" loading="lazy" decoding="async" alt="Import page with three results: an imported sheet, a sheet rejected with line-by-line errors, and a fake PDF rejected at the edge.">
+        <figcaption><p>The web UI after three real imports against the local stack: one imported, one rejected with an error for every failing line, and a fake PDF stopped at the edge before it reached the application.</p></figcaption>
+      </figure>
+    </section>
+
+    <!-- ARCHITECTURE -->
+    <section class="section" id="architecture" aria-labelledby="h-architecture">
+      <h2 id="h-architecture">Solution architecture</h2>
+      <p class="intro">The API signs URLs and owns job state; it never carries the file. Storage, an edge function and a worker pool do the rest, and every stage reports through one database row.</p>
+      <ul class="legend" aria-label="Legend">
+        <li><i></i>Import line</li>
+        <li><i class="fail"></i>Reject line</li>
+      </ul>
+      <div class="figures">
+        <figure>
+          <header><h3>System map</h3><span>Figure 1</span></header>
+          <div class="diagram" tabindex="0" role="region" aria-label="System map diagram">
+            <svg class="dg" viewBox="0 0 920 440" role="img" aria-labelledby="f1-t f1-d">
+              <title id="f1-t">System map</title>
+              <desc id="f1-d">The browser asks the API for an import; the API inserts a pending job row in PostgreSQL and returns a signed URL. The browser uploads the file directly to the entry bucket, bypassing the API. The object-created event reaches the edge validator through a queue. A valid file is moved to the persistent bucket; an invalid one is deleted from the entry bucket. The edge calls the API with a signed webhook, the API submits the task to its process pool, a worker downloads the file from the persistent bucket and writes the records, the status and a NOTIFY to PostgreSQL in one transaction, and the API pushes the result to the browser over a WebSocket from any replica.</desc>
+              <!-- rails -->
+              <path class="rail import" d="M135,160 L135,24 L785,24 L785,60"/>
+              <path class="rail import" d="M230,188 L300,188 L300,88 L365,88"/>
+              <path class="rail import" d="M365,104 L335,104 L335,288 L365,288"/>
+              <path class="rail import" d="M460,116 L460,160"/>
+              <path class="rail import" d="M460,216 L460,260"/>
+              <path class="rail import" d="M555,188 L600,188 L600,388 L690,388"/>
+              <path class="rail import" d="M690,276 L650,276 L650,76 L555,76"/>
+              <path class="rail import" d="M785,116 L785,160"/>
+              <path class="rail import" d="M785,216 L785,260"/>
+              <path class="rail import" d="M785,316 L785,360"/>
+              <path class="rail fail" d="M880,288 L900,288 L900,88 L880,88"/>
+              <!-- boxes -->
+              <rect class="box" x="40" y="160" width="190" height="56" rx="10"/><text class="title" x="135" y="184" text-anchor="middle">Browser</text><text class="small" x="135" y="202" text-anchor="middle">tasks in localStorage</text>
+              <rect class="box" x="365" y="60" width="190" height="56" rx="10"/><text class="title" x="460" y="84" text-anchor="middle">API, any replicas</text><text class="small" x="460" y="102" text-anchor="middle">sign, webhook, push, sweep</text>
+              <rect class="box" x="365" y="160" width="190" height="56" rx="10"/><text class="title" x="460" y="184" text-anchor="middle">Process pool</text><text class="small" x="460" y="202" text-anchor="middle">4 workers per replica</text>
+              <rect class="ext" x="365" y="260" width="190" height="56" rx="10"/><text class="title" x="460" y="284" text-anchor="middle">PostgreSQL</text><text class="small" x="460" y="302" text-anchor="middle">job rows, records, NOTIFY</text>
+              <rect class="ext" x="690" y="60" width="190" height="56" rx="10"/><text class="title" x="785" y="84" text-anchor="middle">Entry bucket</text><text class="small" x="785" y="102" text-anchor="middle">signed PUT, one object</text>
+              <rect class="ext" x="690" y="160" width="190" height="56" rx="10"/><text class="title" x="785" y="184" text-anchor="middle">Event queue</text><text class="small" x="785" y="202" text-anchor="middle">object created</text>
+              <rect class="box" x="690" y="260" width="190" height="56" rx="10"/><text class="title" x="785" y="284" text-anchor="middle">Edge validator</text><text class="small" x="785" y="302" text-anchor="middle">size + 5 bytes</text>
+              <rect class="ext" x="690" y="360" width="190" height="56" rx="10"/><text class="title" x="785" y="384" text-anchor="middle">Persistent bucket</text><text class="small" x="785" y="402" text-anchor="middle">valid files only</text>
+              <!-- line labels -->
+              <text class="small" x="460" y="46" text-anchor="middle">3 PUT the file with the signed URL: the API never sees it</text>
+              <text class="small" x="292" y="140" text-anchor="end">1 POST, 11 push</text>
+              <text class="small" x="327" y="250" text-anchor="end">2 job row, 10 NOTIFY</text>
+              <text class="small" x="470" y="142">7 submit</text>
+              <text class="small" x="470" y="242">9 commit + NOTIFY</text>
+              <text class="small" x="795" y="142">4 event</text>
+              <text class="small" x="795" y="342">5a valid: move</text>
+              <text class="small" x="660" y="230">6 webhook</text>
+              <text class="small" x="590" y="330" text-anchor="end">8 download</text>
+              <text class="small" x="907" y="190" text-anchor="middle" transform="rotate(90 907 190)">5b invalid: delete</text>
+            </svg>
+          </div>
+          <figcaption><p>Results come back through the database, not through the process pool, which is why any replica can push them. A sweeper on every replica reads the job table, so a lost webhook, a dead worker or an abandoned upload all end in a final state.</p></figcaption>
+        </figure>
+        <div class="table-wrap">
+          <table class="stack-sm">
+            <thead><tr><th scope="col">Component</th><th scope="col">In this repo</th><th scope="col">Production original</th><th scope="col">Responsibility</th></tr></thead>
+            <tbody>
+              <tr><th scope="row" data-label="Component">Object storage</th><td data-label="In this repo">LocalStack S3</td><td data-label="Production original">Azure Blob Storage</td><td data-label="Responsibility">Receives the upload, emits the event</td></tr>
+              <tr><th scope="row" data-label="Component">Event delivery</th><td data-label="In this repo">S3 to SQS</td><td data-label="Production original">Blob trigger</td><td data-label="Responsibility">Tells the edge a file arrived</td></tr>
+              <tr><th scope="row" data-label="Component">Edge validator</th><td data-label="In this repo">A Python service</td><td data-label="Production original">Azure Function</td><td data-label="Responsibility">Size and type check, move or delete, call the webhook</td></tr>
+              <tr><th scope="row" data-label="Component">API</th><td data-label="In this repo">FastAPI</td><td data-label="Production original">FastAPI on AKS behind API Management</td><td data-label="Responsibility">Signs URLs, owns job state, hosts the WebSocket</td></tr>
+              <tr><th scope="row" data-label="Component">Workers</th><td data-label="In this repo"><code>ProcessPoolExecutor</code></td><td data-label="Production original"><code>multiprocessing.Pool</code></td><td data-label="Responsibility">Parse and write records</td></tr>
+              <tr><th scope="row" data-label="Component">Job state</th><td data-label="In this repo">A PostgreSQL table</td><td data-label="Production original">A PostgreSQL JSONB table</td><td data-label="Responsibility">The single source of truth</td></tr>
+              <tr><th scope="row" data-label="Component">Client</th><td data-label="In this repo">Plain JavaScript</td><td data-label="Production original">Vue 3 + Pinia</td><td data-label="Responsibility">Upload, subscribe, results list</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- DECISIONS -->
+    <section class="section" id="decisions" aria-labelledby="h-decisions">
+      <h2 id="h-decisions">Decisions</h2>
+      <p class="intro">Seven architecture decision records, one per risk: request limits, correlation, junk input, durability without a broker, multi-replica results, partial imports and forged calls.</p>
+      <div class="ledger">
+        <article class="ledger-row lead">
+          <div class="ledger-head"><h3>Direct upload with signed URLs</h3><a class="adr" href="https://github.com/the3ma/async-import-pipeline/blob/main/docs/adr/0001-direct-upload-with-signed-urls.md">ADR-0001</a></div>
+          <dl>
+            <div><dt>Context</dt><dd>Sending files through the API ties a request, a connection and memory to every upload, and the gateway&rsquo;s limits become the feature&rsquo;s limits.</dd></div>
+            <div><dt>Decision</dt><dd>The API creates a job and returns a signed PUT URL for one object, valid for 15 minutes. The browser uploads straight to storage.</dd></div>
+            <div class="why"><dt>Result</dt><dd>API cost per import does not depend on file size, and the browser never holds a storage credential.</dd></div>
+          </dl>
+        </article>
+        <article class="ledger-row lead">
+          <div class="ledger-head"><h3>A process pool plus a database sweeper, not a message broker</h3><a class="adr" href="https://github.com/the3ma/async-import-pipeline/blob/main/docs/adr/0004-process-pool-with-a-database-sweeper.md">ADR-0004</a></div>
+          <dl>
+            <div><dt>Context</dt><dd>Parsing is CPU-bound, volume is low and a broker is one more system to run. The original&rsquo;s in-memory pool stranded jobs on restart.</dd></div>
+            <div><dt>Decision</dt><dd>Keep the pool in the API and treat the job row as the durable queue. A sweeper resubmits stale jobs up to 3 times, recovers ones whose file arrived and expires the rest.</dd></div>
+            <div class="why"><dt>Result</dt><dd>Durable jobs that survive restarts, with no broker to run. A row lock and upserts make at-least-once workers safe.</dd></div>
+          </dl>
+        </article>
+        <article class="ledger-row">
+          <div class="ledger-head"><h3>The filename is the correlation ID</h3><a class="adr" href="https://github.com/the3ma/async-import-pipeline/blob/main/docs/adr/0002-filename-is-the-correlation-id.md">ADR-0002</a></div>
+          <dl>
+            <div><dt>Context</dt><dd>The upload, the storage event and the job row share no session; something must link them.</dd></div>
+            <div><dt>Decision</dt><dd>The object key is the server-generated task UUID; the user&rsquo;s filename is only data in the job row.</dd></div>
+            <div class="why"><dt>Result</dt><dd>No lookup table, no collisions and no user input in storage keys.</dd></div>
+          </dl>
+        </article>
+        <article class="ledger-row">
+          <div class="ledger-head"><h3>Validate at the edge, before the application</h3><a class="adr" href="https://github.com/the3ma/async-import-pipeline/blob/main/docs/adr/0003-edge-validation-before-the-application.md">ADR-0003</a></div>
+          <dl>
+            <div><dt>Context</dt><dd>Junk files should not use a worker slot or reach a PDF parser.</dd></div>
+            <div><dt>Decision</dt><dd>A storage-triggered function checks the size from the event and the <code>%PDF-</code> signature from a 5-byte ranged read; it moves or deletes the file.</dd></div>
+            <div class="why"><dt>Result</dt><dd>A rejected file costs a few bytes of reading, not a parse.</dd></div>
+          </dl>
+        </article>
+        <article class="ledger-row">
+          <div class="ledger-head"><h3>WebSocket push, backed by the job row</h3><a class="adr" href="https://github.com/the3ma/async-import-pipeline/blob/main/docs/adr/0005-websocket-push-backed-by-the-job-row.md">ADR-0005</a></div>
+          <dl>
+            <div><dt>Context</dt><dd>Polling wastes requests, and the original kept results in process memory: one replica, lost on restart.</dd></div>
+            <div><dt>Decision</dt><dd>Subscribing registers first, then reads the row; Postgres <code>NOTIFY</code> fans changes out to every replica.</dd></div>
+            <div class="why"><dt>Result</dt><dd>Any replica serves any subscriber, without Redis, and a late subscriber still gets the result.</dd></div>
+          </dl>
+        </article>
+        <article class="ledger-row">
+          <div class="ledger-head"><h3>One transaction per file</h3><a class="adr" href="https://github.com/the3ma/async-import-pipeline/blob/main/docs/adr/0006-one-transaction-per-file.md">ADR-0006</a></div>
+          <dl>
+            <div><dt>Context</dt><dd>A partially imported file is worse than a failed one: the user has to work out what landed.</dd></div>
+            <div><dt>Decision</dt><dd>Validate every row and report all errors together, then upsert every record in one transaction, in sorted order.</dd></div>
+            <div class="why"><dt>Result</dt><dd>A failed file writes nothing, reruns are safe, and sorted writes stop overlapping imports from deadlocking.</dd></div>
+          </dl>
+        </article>
+        <article class="ledger-row">
+          <div class="ledger-head"><h3>A signed webhook and per-task tokens</h3><a class="adr" href="https://github.com/the3ma/async-import-pipeline/blob/main/docs/adr/0007-signed-webhook-and-task-tokens.md">ADR-0007</a></div>
+          <dl>
+            <div><dt>Context</dt><dd>The original relied on network placement to protect its webhook, and a task UUID was the only credential for a result.</dd></div>
+            <div><dt>Decision</dt><dd>The edge signs webhook bodies with HMAC-SHA256; a per-task HMAC token is required to read or subscribe.</dd></div>
+            <div class="why"><dt>Result</dt><dd>A caller inside the network can&rsquo;t forge a result, and a task ID alone reveals nothing.</dd></div>
+          </dl>
+        </article>
+      </div>
+    </section>
+
+    <!-- IMPLEMENTATION -->
+    <section class="section" id="implementation" aria-labelledby="h-implementation">
+      <h2 id="h-implementation">Implementation</h2>
+      <p class="intro">Three mechanisms carry the guarantees: one row per job with guarded transitions, an edge that judges a file by five bytes, and a sweeper that assumes nothing arrives.</p>
+      <div class="figures">
+        <figure>
+          <header><h3>Every job ends in a final state</h3><span>Figure 2</span></header>
+          <div class="diagram" tabindex="0" role="region" aria-label="Job state diagram">
+            <svg class="dg" viewBox="0 0 920 300" role="img" aria-labelledby="f2-t f2-d">
+              <title id="f2-t">Every job ends in a final state</title>
+              <desc id="f2-d">A job is created as pending when the import is requested. It moves to processing when the edge accepts the file or the sweeper finds it, and to success when the records are committed. From pending it can end in error when the edge rejects the file or the upload expires; from processing it ends in error on bad content or a lost worker. The sweeper retries a stale processing job up to three attempts.</desc>
+              <path class="rail fail" d="M320,100 L320,170 Q320,240 390,240 L440,240"/>
+              <path class="rail fail" d="M560,100 L560,170 Q560,240 490,240 L440,240"/>
+              <path class="rail recover" d="M572,110 C 620,170 680,240 760,240"/>
+              <path class="rail import" d="M90,100 L820,100"/>
+              <circle class="stn import" cx="90" cy="100" r="11"/>
+              <circle class="stn ix" cx="320" cy="100" r="14"/>
+              <circle class="stn ix" cx="560" cy="100" r="14"/>
+              <circle class="stn term" cx="820" cy="100" r="13"/>
+              <circle class="stn term" cx="440" cy="240" r="13" style="fill:var(--l-fail);stroke:var(--l-fail)"/>
+              <circle class="stn recover" cx="760" cy="240" r="11"/>
+              <text class="title" x="90" y="54" text-anchor="middle">POST /imports</text>
+              <text class="small" x="90" y="138" text-anchor="middle">job row inserted</text>
+              <text class="title" x="320" y="54" text-anchor="middle">pending</text>
+              <text class="small" x="320" y="76" text-anchor="middle">waiting for the upload</text>
+              <text class="title" x="560" y="54" text-anchor="middle">processing</text>
+              <text class="small" x="560" y="76" text-anchor="middle">edge accepted, or file found</text>
+              <text class="title" x="820" y="54" text-anchor="middle">success</text>
+              <text class="small" x="820" y="138" text-anchor="middle">records committed</text>
+              <text class="title" x="440" y="276" text-anchor="middle">error</text>
+              <text class="small" x="440" y="294" text-anchor="middle">rejected, expired, bad content, worker lost</text>
+              <text class="title" x="760" y="276" text-anchor="middle">sweeper retry</text>
+              <text class="small" x="760" y="294" text-anchor="middle">back to processing, up to 3 attempts</text>
+            </svg>
+          </div>
+          <figcaption><p>Every transition out of <code>pending</code> is one atomic <code>UPDATE &hellip; WHERE status = 'pending'</code>. That single condition makes duplicate webhooks harmless and stops replicas racing.</p></figcaption>
+        </figure>
+
+        <figure>
+          <header><h3>The edge judges a file by five bytes</h3><span>Figure 3</span></header>
+          <div class="diagram" tabindex="0" role="region" aria-label="Edge validation diagram">
+            <svg class="dg" viewBox="0 0 920 290" role="img" aria-labelledby="f3-t f3-d">
+              <title id="f3-t">The edge judges a file by five bytes</title>
+              <desc id="f3-d">When an object is created in the entry bucket, the edge checks that its key is a UUID; if not, the object is not ours and is deleted. It then checks the size from the event, and reads five bytes to check that the file starts with %PDF-. A file that is too large or of the wrong type is deleted and the API is told why, with FILE_TOO_LARGE or INVALID_FILE_TYPE. A valid file is copied to the persistent bucket and deleted from entry, and the API is notified of success and the folder.</desc>
+              <path class="rail muted" d="M236,80 L236,220"/>
+              <path class="rail fail" d="M392,80 L392,150 Q392,220 432,220 L470,220"/>
+              <path class="rail fail" d="M548,80 L548,150 Q548,220 508,220 L470,220"/>
+              <path class="rail import" d="M80,80 L860,80"/>
+              <circle class="stn import" cx="80" cy="80" r="11"/>
+              <circle class="stn ix" cx="236" cy="80" r="14"/>
+              <circle class="stn ix" cx="392" cy="80" r="14"/>
+              <circle class="stn ix" cx="548" cy="80" r="14"/>
+              <circle class="stn import" cx="704" cy="80" r="11"/>
+              <circle class="stn term" cx="860" cy="80" r="13"/>
+              <circle class="stn" cx="236" cy="220" r="11"/>
+              <circle class="stn term" cx="470" cy="220" r="13" style="fill:var(--l-fail);stroke:var(--l-fail)"/>
+              <text class="title" x="80" y="44" text-anchor="middle">Object created</text>
+              <text class="small" x="80" y="118" text-anchor="middle">in the entry bucket</text>
+              <text class="title" x="236" y="44" text-anchor="middle">Key is a UUID?</text>
+              <text class="title" x="392" y="44" text-anchor="middle">Size in limit?</text>
+              <text class="title" x="548" y="44" text-anchor="middle">Starts %PDF-?</text>
+              <text class="title" x="704" y="44" text-anchor="middle">Moved</text>
+              <text class="small" x="704" y="118" text-anchor="middle">to persistent</text>
+              <text class="title" x="860" y="44" text-anchor="middle">API notified</text>
+              <text class="small" x="860" y="118" text-anchor="middle">success + folder</text>
+              <text class="small lbl" x="392" y="150" text-anchor="middle">FILE_TOO_LARGE</text>
+              <text class="small lbl" x="548" y="150" text-anchor="middle">INVALID_FILE_TYPE</text>
+              <text class="title" x="236" y="256" text-anchor="middle">Not ours</text>
+              <text class="small" x="236" y="274" text-anchor="middle">deleted, no job to tell</text>
+              <text class="title" x="470" y="256" text-anchor="middle">Rejected</text>
+              <text class="small" x="470" y="274" text-anchor="middle">deleted, the API told why</text>
+            </svg>
+          </div>
+          <figcaption><p>The edge never downloads the file: the size comes from the event and the signature from a 5-byte ranged read. If the edge crashes, the queue redelivers the event. The signature check proves the type claim only; it is not a malware check.</p></figcaption>
+        </figure>
+      </div>
+
+      <h3 class="subhead">Nothing assumes a message arrives</h3>
+      <div class="table-wrap">
+        <table class="stack-sm">
+          <thead><tr><th scope="col">Failure</th><th scope="col">What happens</th></tr></thead>
+          <tbody>
+            <tr><th scope="row" data-label="Failure">The edge is down</th><td data-label="What happens">Events wait in the queue</td></tr>
+            <tr><th scope="row" data-label="Failure">The webhook is lost after all retries</th><td data-label="What happens">The sweeper finds the moved file and resumes</td></tr>
+            <tr><th scope="row" data-label="Failure">A worker is killed</th><td data-label="What happens">The pool is replaced and the sweeper resubmits</td></tr>
+            <tr><th scope="row" data-label="Failure">The API restarts</th><td data-label="What happens">The sweeper resubmits, and the browser reconnects and resubscribes</td></tr>
+            <tr><th scope="row" data-label="Failure">The user abandons the upload</th><td data-label="What happens">The job expires, and a lifecycle rule clears the entry bucket</td></tr>
+            <tr><th scope="row" data-label="Failure">The same event is delivered twice</th><td data-label="What happens">The second finds no object, or no pending job</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="source-note">Connections can&rsquo;t cross a process boundary, so the API sends a worker only the task ID and the worker builds its own clients. The worker always writes a final state, whatever it catches.</p>
+    </section>
+
+    <!-- OPERATIONS -->
+    <section class="section" id="operations" aria-labelledby="h-operations">
+      <h2 id="h-operations">Taking it to production</h2>
+      <p class="intro">The pipeline needs four things from a platform, and the same design maps onto AWS or Azure.</p>
+      <div class="table-wrap">
+        <table class="stack-sm">
+          <thead><tr><th scope="col">Need</th><th scope="col">Local</th><th scope="col">AWS</th><th scope="col">Azure</th></tr></thead>
+          <tbody>
+            <tr><th scope="row" data-label="Need">Object storage with a signed PUT</th><td data-label="Local">LocalStack S3</td><td data-label="AWS">S3</td><td data-label="Azure">Blob Storage, write-only SAS</td></tr>
+            <tr><th scope="row" data-label="Need">An object-created event</th><td data-label="Local">S3 to SQS</td><td data-label="AWS">S3 to SQS or EventBridge</td><td data-label="Azure">Event Grid, or a blob trigger</td></tr>
+            <tr><th scope="row" data-label="Need">The edge validator</th><td data-label="Local">A Python service</td><td data-label="AWS">Lambda</td><td data-label="Azure">Azure Function</td></tr>
+            <tr><th scope="row" data-label="Need">A private route to the webhook</th><td data-label="Local">The Compose network</td><td data-label="AWS">VPC</td><td data-label="Azure">VNet integration, private DNS</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3 class="subhead">The production checklist</h3>
+      <ul class="stations">
+        <li><strong>Secrets and auth</strong><span>The signing secret from a secret store (services refuse to start without it), real authentication on imports, and jobs tied to users.</span></li>
+        <li><strong>A private webhook</strong><span>Keep the webhook off the public gateway.</span></li>
+        <li><strong>Locked-down buckets</strong><span>Private buckets, CORS limited to the app origin, a lifecycle rule on entry and a retention decision for persistent.</span></li>
+        <li><strong>Untrusted files</strong><span>Malware scanning before a worker reads a file, and a parser run with memory and time limits.</span></li>
+        <li><strong>Scale and resilience</strong><span>Connection pooling in the API and a dead-letter queue for storage events.</span></li>
+        <li><strong>Alerts</strong><span>On failed result delivery, on <code>WORKER_LOST</code> and on the age of the oldest open job.</span></li>
+        <li><strong>Tuned recovery</strong><span>Sweep and stale timeouts above the longest real import.</span></li>
+        <li><strong>Migrations</strong><span>Schema migrations instead of a single schema file.</span></li>
+      </ul>
+    </section>
+
+    <!-- TRADE-OFFS -->
+    <section class="section" id="tradeoffs" aria-labelledby="h-tradeoffs">
+      <h2 id="h-tradeoffs">Trade-offs</h2>
+      <p class="intro">Every decision gave something up. These are the costs accepted on purpose.</p>
+      <div class="table-wrap">
+        <table class="stack-sm">
+          <thead><tr><th scope="col">Chose</th><th scope="col">Instead of</th><th scope="col">The cost</th></tr></thead>
+          <tbody>
+            <tr><th scope="row" data-label="Chose">An in-process pool + sweeper</th><td data-label="Instead of">Celery, or a message bus</td><td data-label="The cost">Workers scale only with API replicas.</td></tr>
+            <tr><th scope="row" data-label="Chose">Postgres <code>NOTIFY</code></th><td data-label="Instead of">Redis pub/sub</td><td data-label="The cost">A missed notification waits for the next subscribe.</td></tr>
+            <tr><th scope="row" data-label="Chose">WebSocket push</th><td data-label="Instead of">Polling</td><td data-label="The cost">Stateful connections through the gateway.</td></tr>
+            <tr><th scope="row" data-label="Chose">One transaction per file</th><td data-label="Instead of">Per-row commits</td><td data-label="The cost">One bad row fails the whole file, with every error reported at once.</td></tr>
+            <tr><th scope="row" data-label="Chose">An edge validator</th><td data-label="Instead of">Validating in the worker</td><td data-label="The cost">One more deployable.</td></tr>
+            <tr><th scope="row" data-label="Chose">A fixed sheet format</th><td data-label="Instead of">Free-form extraction</td><td data-label="The cost">Reliable and cheap, but a format change needs code.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- RESULTS -->
+    <section class="section" id="results" aria-labelledby="h-results">
+      <h2 id="h-results">Results</h2>
+      <p class="intro">The production original has run for two years. This rebuild is checked by acceptance tests against the running stack and measured with the benchmark below.</p>
+      <ul class="stations">
+        <li><strong>API cost is flat</strong><span>The API call takes 6 ms at every file size, because the file never touches it.</span></li>
+        <li><strong>The API stays responsive</strong><span>Its p95 was 5.3 ms idle and 11.8 ms during 40 imports of 5 MB, 8 at a time.</span></li>
+        <li><strong>Self-healing jobs</strong><span>Every job ends in a final state, whatever fails.</span></li>
+        <li><strong>Idempotent at every step</strong><span>Duplicate events, webhooks and worker runs are harmless.</span></li>
+        <li><strong>Least-privilege upload</strong><span>The URL is write-only, for one object, for 15 minutes.</span></li>
+        <li><strong>Reload-proof</strong><span>Checked in a real browser, with the edge stopped and the API restarted mid-import.</span></li>
+      </ul>
+      <h3 class="subhead">Measured with <code>make bench</code></h3>
+      <div class="table-wrap">
+        <table class="stack-sm">
+          <thead><tr><th scope="col">File size</th><th scope="col">API call p50</th><th scope="col">End-to-end p50</th><th scope="col">End-to-end p95</th></tr></thead>
+          <tbody>
+            <tr><th scope="row" data-label="File size">2 KB</th><td class="num" data-label="API call p50">6 ms</td><td class="num" data-label="End-to-end p50">0.04 s</td><td class="num" data-label="End-to-end p95">0.10 s</td></tr>
+            <tr><th scope="row" data-label="File size">1 MB</th><td class="num" data-label="API call p50">6 ms</td><td class="num" data-label="End-to-end p50">0.05 s</td><td class="num" data-label="End-to-end p95">0.08 s</td></tr>
+            <tr><th scope="row" data-label="File size">5 MB</th><td class="num" data-label="API call p50">6 ms</td><td class="num" data-label="End-to-end p50">0.17 s</td><td class="num" data-label="End-to-end p95">0.23 s</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="source-note">20 runs per size against LocalStack. They show the shape, not production capacity: the padded test files have two rows, so they measure moving bytes, not parsing large sheets.</p>
+      <h3 class="subhead">System figures</h3>
+      <div class="table-wrap">
+        <table class="stack-sm">
+          <thead><tr><th scope="col">Setting</th><th scope="col">Value</th><th scope="col">Why</th></tr></thead>
+          <tbody>
+            <tr><th scope="row" data-label="Setting">Signed URL lifetime</th><td class="num" data-label="Value">900 s</td><td data-label="Why">Long enough for a slow upload, short enough to limit a leak.</td></tr>
+            <tr><th scope="row" data-label="Setting">Max file size</th><td class="num" data-label="Value">5,120,000 bytes</td><td data-label="Why">Sheets are small.</td></tr>
+            <tr><th scope="row" data-label="Setting">Workers</th><td class="num" data-label="Value">4 per replica</td><td data-label="Why">CPU-bound parsing.</td></tr>
+            <tr><th scope="row" data-label="Setting">Webhook retries</th><td class="num" data-label="Value">3 attempts, 30 s timeout</td><td data-label="Why">1 s and 2 s backoff ride out an API restart.</td></tr>
+            <tr><th scope="row" data-label="Setting">Worker attempts</th><td class="num" data-label="Value">3</td><td data-label="Why">Then <code>WORKER_LOST</code>, so a poison file can&rsquo;t loop forever.</td></tr>
+            <tr><th scope="row" data-label="Setting">Sweeper</th><td class="num" data-label="Value">every 30 s, stale after 120 s</td><td data-label="Why">Compose uses 2 s and 5 s so the tests are quick.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- TRY IT -->
+    <section class="section" id="try" aria-labelledby="h-try">
+      <h2 id="h-try">Try it yourself</h2>
+      <p class="intro">The whole stack runs locally with Docker Compose and uv: two API replicas, the edge validator, PostgreSQL and LocalStack for S3 and SQS.</p>
+<pre class="terminal" aria-label="Commands to run the project locally"><span class="p">$ </span>git clone https://github.com/the3ma/async-import-pipeline.git
+<span class="p">$ </span>cd async-import-pipeline
+<span class="p">$ </span>make up     <span class="c"># API x2, edge validator, PostgreSQL, LocalStack (S3 + SQS)</span>
+<span class="p">$ </span>make test   <span class="c"># unit tests, no Docker needed</span>
+<span class="p">$ </span>make e2e    <span class="c"># acceptance tests against the running stack</span>
+<span class="p">$ </span>make bench  <span class="c"># API cost and latency on your machine</span>
+<span class="p">$ </span>make down</pre>
+      <p class="source-note">Then open <code>http://localhost:8100</code> and use the sample links on the page. The API, WebSocket, webhook and error codes are in the <a href="https://github.com/the3ma/async-import-pipeline/blob/main/docs/CONTRACT.md">contract</a>.</p>
+    </section>
+
+    <!-- LESSONS -->
+    <section class="section" id="lessons" aria-labelledby="h-lessons">
+      <h2 id="h-lessons">Lessons from the production original</h2>
+      <p class="intro">What the first version taught, and what carries over to the next pipeline.</p>
+      <ul class="stations">
+        <li><strong>Write back the location when a file moves.</strong><span>The worker looked in the old container until a later fix; local runs could not show it, because the file never moved there.</span></li>
+        <li><strong>Check config names end to end.</strong><span>Variables named differently in the infrastructure code and the app fall back silently to defaults. Fail at startup.</span></li>
+        <li><strong>Always send the correlation ID.</strong><span>A read failure that reports an unknown filename can never be matched to a job. Take the name from the trigger.</span></li>
+        <li><strong>Use bind parameters everywhere,</strong><span>including internal stores. File metadata is user input.</span></li>
+        <li><strong>Test recovery with a real kill.</strong><span>A simulated crash test passed while a real <code>kill -9</code> hung every later import by breaking the process pool for good; a healthy replica masked the bug until the test ran on a single instance.</span></li>
+      </ul>
+    </section>
+
+    <!-- NEXT -->
+    <section class="section" id="next" aria-labelledby="h-next">
+      <h2 id="h-next">What&rsquo;s next</h2>
+      <p class="intro">Still open in this repository, each with its next step.</p>
+      <ul class="stations">
+        <li><strong>User authentication</strong><span>Task tokens are capabilities, and anyone can start an import. Add auth and tie jobs to users.</span></li>
+        <li><strong>Malware scanning</strong><span>Only the signature is checked before the parser. Scan in storage and sandbox the parser.</span></li>
+        <li><strong>Size before upload</strong><span>A signed PUT can&rsquo;t cap size, so oversized files reach storage first. S3 POST policies can cap it; Azure SAS can&rsquo;t.</span></li>
+        <li><strong>Workers on their own</strong><span>Heavy parsing competes with the API for CPU. Move the workers to a dedicated service.</span></li>
+        <li><strong>A versioned sheet format</strong><span>Today any format change needs code.</span></li>
+        <li><strong>A real cloud run</strong><span>Tested on LocalStack only; this repository has not run on AWS or Azure.</span></li>
+      </ul>
+    </section>
+
+    <!-- CONTACT -->
+    <section class="contact" id="contact" aria-labelledby="h-contact">
+      <h2 id="h-contact">Moving user files into a system that has to stay up?</h2>
+      <p>I design and build systems like this one. If you are hiring, or have a problem that looks like it, I&rsquo;d like to hear about it.</p>
+      <ul class="contact-list">
+        <li><a href="mailto:the3ma@gmail.com"><small>Email</small><b>the3ma@gmail.com</b></a></li>
+        <li><a href="https://www.linkedin.com/in/hristo-atanasov-84a525175/"><small>LinkedIn</small><b>Hristo Atanasov</b></a></li>
+        <li><a href="https://github.com/the3ma"><small>GitHub</small><b>github.com/the3ma</b></a></li>
+      </ul>
+    </section>
+  </article>
+</div>
+</main>
+
+<footer class="site">
+  <div class="wrap"><p>Generalized from production work: the employer, client and product are not named, and details are changed. The companion to the <a href="https://the3ma.github.io/async-export-pipeline/">async export pipeline</a>: that one moves data out, this one moves data in. Source code under the MIT licence at <a href="https://github.com/the3ma/async-import-pipeline">github.com/the3ma/async-import-pipeline</a>.</p></div>
+</footer>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    var media = window.matchMedia('(prefers-color-scheme: light)');
+    var btn = document.getElementById('theme-toggle');
+    var label = btn.querySelector('.label');
+    function isDark() { var t = root.getAttribute('data-theme'); return t ? t === 'dark' : !media.matches; }
+    function render() {
+      var dark = isDark();
+      root.setAttribute('data-resolved', dark ? 'dark' : 'light');
+      label.textContent = dark ? 'Light theme' : 'Dark theme';
+      btn.setAttribute('aria-pressed', String(!dark));
+      btn.setAttribute('aria-label', dark ? 'Switch to the light theme' : 'Switch to the dark theme');
+    }
+    btn.addEventListener('click', function () {
+      var next = isDark() ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      try { localStorage.setItem('theme', next); } catch (e) {}
+      render();
+    });
+    media.addEventListener('change', render);
+    render();
+
+    // Progress bar + the rail as a transit line: stations passed, current station, line fill.
+    var bar = document.querySelector('.progress');
+    var rail = document.querySelector('.toc ol');
+    var links = Array.prototype.slice.call(document.querySelectorAll('.toc a'));
+    var mlinks = Array.prototype.slice.call(document.querySelectorAll('.toc-mobile a'));
+    var mcurrent = document.querySelector('.toc-current');
+    var sections = links.map(function (a) { return document.getElementById(a.getAttribute('href').slice(1)); });
+    var current = null, ticking = false;
+    function update() {
+      var max = document.documentElement.scrollHeight - window.innerHeight;
+      bar.style.transform = 'scaleX(' + (max > 0 ? Math.min(1, window.scrollY / max) : 0) + ')';
+      var active = -1;
+      for (var i = 0; i < sections.length; i++) { if (sections[i] && sections[i].getBoundingClientRect().top <= 140) active = i; }
+      var last = sections[sections.length - 1];
+      if ((max > 0 && window.scrollY >= max - 2) || (last && last.getBoundingClientRect().top < window.innerHeight * 0.6)) active = sections.length - 1;
+      if (active !== current) {
+        [links, mlinks].forEach(function (list) {
+          list.forEach(function (a, j) {
+            if (j === active) a.setAttribute('aria-current', 'true'); else a.removeAttribute('aria-current');
+            a.classList.toggle('passed', j < active);
+          });
+        });
+        if (mcurrent) mcurrent.textContent = active > -1 ? links[active].textContent : '';
+        if (rail) {
+          var fill = 0;
+          if (active > -1 && links[active].offsetParent) {
+            var dot = links[active].getBoundingClientRect(), top = rail.getBoundingClientRect();
+            fill = Math.max(0, dot.top + dot.height / 2 - top.top - 12);
+          }
+          rail.style.setProperty('--fill', fill + 'px');
+        }
+        current = active;
+      }
+      ticking = false;
+    }
+    window.addEventListener('scroll', function () { if (!ticking) { ticking = true; requestAnimationFrame(update); } }, { passive: true });
+    window.addEventListener('resize', function () { current = null; update(); });
+    update();
+    var mobile = document.querySelector('.toc-mobile');
+    if (mobile) mobile.addEventListener('click', function (e) { if (e.target.closest('a')) mobile.removeAttribute('open'); });
+  })();
+</script>
+</body>
+</html>

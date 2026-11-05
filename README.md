@@ -22,7 +22,7 @@ A browser uploads straight to object storage with a short-lived signed URL. A st
 
 It is the companion to [Async Export Pipeline](https://the3ma.github.io/async-export-pipeline/): that one moves data out, this one moves data in.
 
-> Generalised from production work. The client and product are not named, and the demo domain (price sheets) is invented. This is a new implementation, not the original code. It also fixes the original's known weaknesses: see [what changed](#limitations).
+> Generalised from production work: the production original has run for two years. The client and product are not named, and the demo domain (price sheets) is invented. This is a new implementation, not the original code. It also fixes the original's known weaknesses: see [what changed](#limitations).
 
 ## Summary
 
@@ -84,7 +84,7 @@ These are the failure modes of a synchronous import, not incidents from the orig
 |---|---|---|
 | **Catalogue editor** | Load price sheets | Pick a file, carry on, see every problem in a bad file at once |
 | **Operator** | Keep imports healthy | Machine-readable error codes, one row per job, self-healing jobs |
-| **Developer** | Change the pipeline | The whole flow on a laptop with one command, and no cloud account |
+| **Developer** | Change the pipeline | The whole flow on one machine with one command, and no cloud account |
 
 ## Architecture
 
@@ -268,7 +268,7 @@ Each one has a full record in [`docs/adr`](docs/adr).
 
 ## Wins
 
-**Measured** with `make bench`: 20 runs per size on a laptop against LocalStack. These show the shape, not production capacity. The padded test files have two rows, so they measure moving bytes, not parsing large sheets.
+**Measured** with `make bench`: 20 runs per size against LocalStack. These show the shape, not production capacity. The padded test files have two rows, so they measure moving bytes, not parsing large sheets.
 
 | File size | API call p50 | End-to-end p50 | End-to-end p95 |
 |---|---|---|---|

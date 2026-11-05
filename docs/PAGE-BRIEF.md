@@ -30,6 +30,7 @@ How to build a page like the [Async Export Pipeline case study](https://the3ma.g
 | 11 | Results | README: Wins |
 | 12 | Try it | README: Quick start |
 | 13 | Lessons | `docs/PRODUCTION.md` |
-| 14 | Contact | Same as the export page: email, LinkedIn, GitHub |
+| 14 | What's next | README: Limitations, still open |
+| 15 | Contact | Same as the export page: email, LinkedIn, GitHub |
 
 **Footer note:** Generalized from production work: the employer, client and product are not named, and details are changed. Source code under the MIT licence.
